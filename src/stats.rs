@@ -24,11 +24,15 @@ pub struct Stats {
     pub bat_status: String,
     pub power_w: f32, // + charging, - discharging
     pub power_hist: VecDeque<f32>,
+    pub net_rx: f32, // KiB/s
+    pub net_tx: f32,
+    pub net_hist: VecDeque<f32>,
     pub t_cpu: i32,
     pub t_gpu: i32,
     prev_cpu: Option<(u64, u64)>,
     prev_gpu: HashMap<u64, u64>,
     prev_gpu_t: Option<Instant>,
+    prev_net: Option<(u64, u64, Instant)>,
     gpu_fds: Vec<String>,
     gpu_scan: u32,
 }
@@ -136,6 +140,29 @@ impl Stats {
             num(&format!("{b}/voltage_now")) as f32 / 1e6 * num(&format!("{b}/current_now")) as f32 / 1e6
         };
         push(&mut self.power_hist, self.power_w);
+
+        // network: every interface except lo / usb gadget / tailscale
+        let (mut rx, mut tx) = (0u64, 0u64);
+        for l in read("/proc/net/dev").lines().skip(2) {
+            let Some((name, rest)) = l.split_once(':') else { continue };
+            let n = name.trim();
+            if n == "lo" || n.starts_with("usb") || n.starts_with("tailscale") || n.starts_with("docker") {
+                continue;
+            }
+            let v: Vec<u64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            if v.len() > 8 {
+                rx += v[0];
+                tx += v[8];
+            }
+        }
+        let now = Instant::now();
+        if let Some((prx, ptx, pt)) = self.prev_net {
+            let dt = now.duration_since(pt).as_secs_f32().max(0.1);
+            self.net_rx = rx.saturating_sub(prx) as f32 / 1024.0 / dt;
+            self.net_tx = tx.saturating_sub(ptx) as f32 / 1024.0 / dt;
+            push(&mut self.net_hist, self.net_rx + self.net_tx);
+        }
+        self.prev_net = Some((rx, tx, now));
 
         // temperatures: hottest cpu zone, hottest gpu zone
         self.t_cpu = 0;

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The touchscreen, grabbed: niri never sees these touches, so the pointer stays
-//! on the monitor. Raw panel coordinates (portrait 1600x2560) are mapped to the
-//! landscape buffer of the overlay (niri transform 270): X = y, Y = xmax - x.
+//! on the monitor. Raw panel coordinates (the panel's native orientation) are
+//! mapped to the overlay's buffer for the output transform, e.g. for 270:
+//! X = y, Y = xmax - x.
 use evdev::raw_stream::RawDevice;
 use evdev::{EventType, InputEvent};
 use std::collections::HashMap;
@@ -40,10 +41,11 @@ pub struct RawTouch {
     ymax: f32,
     slot: usize,
     slots: HashMap<usize, Slot>,
+    rot: u16,
 }
 
 impl RawTouch {
-    pub fn open(name: &str) -> std::io::Result<Self> {
+    pub fn open(name: &str, rot: u16) -> std::io::Result<Self> {
         for (_path, mut dev) in evdev::raw_stream::enumerate() {
             if dev.name().map_or(false, |n| n.contains(name)) {
                 let abs = dev.get_abs_state()?;
@@ -55,7 +57,7 @@ impl RawTouch {
                     let fl = libc::fcntl(fd, libc::F_GETFL);
                     libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
                 }
-                return Ok(Self { dev, xmax, ymax, slot: 0, slots: HashMap::new() });
+                return Ok(Self { dev, xmax, ymax, slot: 0, slots: HashMap::new(), rot });
             }
         }
         Err(std::io::Error::new(std::io::ErrorKind::NotFound, "touchscreen not found"))
@@ -114,8 +116,13 @@ impl RawTouch {
     fn flush(&mut self, w: f32, h: f32, out: &mut Vec<Touch>) {
         let mut gone = Vec::new();
         for (k, s) in self.slots.iter_mut() {
-            let x = s.y as f32 * w / self.ymax;
-            let y = (self.xmax - 1.0 - s.x as f32) * h / self.xmax;
+            let (rx, ry) = (s.x as f32, s.y as f32);
+            let (x, y) = match self.rot {
+                90 => ((self.ymax - 1.0 - ry) * w / self.ymax, rx * h / self.xmax),
+                180 => ((self.xmax - 1.0 - rx) * w / self.xmax, (self.ymax - 1.0 - ry) * h / self.ymax),
+                270 => (ry * w / self.ymax, (self.xmax - 1.0 - rx) * h / self.xmax),
+                _ => (rx * w / self.xmax, ry * h / self.ymax),
+            };
             let kind = match s.state {
                 0 => {
                     s.state = 1;

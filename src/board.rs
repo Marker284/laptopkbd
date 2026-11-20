@@ -24,7 +24,8 @@ pub struct Board {
     kbd: VirtualDevice,
     mouse: VirtualDevice,
     pub down: HashMap<i32, usize>, // touch id -> key index
-    codes: Vec<u16>,
+    codes: Vec<u16>, // per key index of the current layout
+    all: Vec<u16>,   // everything the uinput keyboard can send
     pub latched: HashSet<u16>,
     pub locked: HashSet<u16>,
     mod_used: HashSet<u16>,
@@ -39,6 +40,9 @@ pub struct Board {
     acc: (f32, f32),
     wacc: (f32, f32),
     pub gain: f32, // pointer px per buffer px
+    natural: bool,
+    tap: bool,
+    gestures: bool,
 }
 
 fn is_mod(c: u16) -> bool {
@@ -49,9 +53,9 @@ fn is_mod(c: u16) -> bool {
 }
 
 impl Board {
-    pub fn new(codes: Vec<u16>, gain: f32) -> std::io::Result<Self> {
+    pub fn new(all: Vec<u16>, codes: Vec<u16>, gain: f32) -> std::io::Result<Self> {
         let mut keys = AttributeSet::<K>::new();
-        for c in &codes {
+        for c in &all {
             keys.insert(K(*c));
         }
         let kbd = VirtualDevice::builder()?.name("laptopkbd keyboard").with_keys(&keys)?.build()?;
@@ -73,6 +77,7 @@ impl Board {
             mouse,
             down: HashMap::new(),
             codes,
+            all,
             latched: HashSet::new(),
             locked: HashSet::new(),
             mod_used: HashSet::new(),
@@ -87,7 +92,28 @@ impl Board {
             acc: (0.0, 0.0),
             wacc: (0.0, 0.0),
             gain,
+            natural: true,
+            tap: true,
+            gestures: true,
         })
+    }
+
+    pub fn configure(&mut self, t: &crate::config::Trackpad, base_gain: f32) {
+        self.gain = base_gain * t.speed;
+        self.natural = t.natural_scroll;
+        self.tap = t.tap_to_click;
+        self.gestures = t.gestures;
+    }
+
+    /// New layout (F-row mode changed): release everything first.
+    pub fn set_keys(&mut self, codes: Vec<u16>) {
+        self.release_all();
+        self.codes = codes;
+    }
+
+    pub fn tux_active(&self) -> bool {
+        let m = K::KEY_LEFTMETA.0;
+        self.latched.contains(&m) || self.locked.contains(&m) || self.down.values().any(|i| self.codes[*i] == m)
     }
 
     fn key(&mut self, code: u16, v: i32) {
@@ -102,8 +128,7 @@ impl Board {
     }
 
     pub fn release_all(&mut self) {
-        let codes = self.codes.clone();
-        let ev: Vec<InputEvent> = codes.iter().map(|c| InputEvent::new(EventType::KEY.0, *c, 0)).collect();
+        let ev: Vec<InputEvent> = self.all.iter().map(|c| InputEvent::new(EventType::KEY.0, *c, 0)).collect();
         let _ = self.kbd.emit(&ev);
         for b in [K::BTN_LEFT, K::BTN_RIGHT, K::BTN_MIDDLE] {
             self.btn(b, 0);
@@ -228,9 +253,10 @@ impl Board {
                 let _ = self.mouse.emit(&ev);
             }
         } else if n == 2 {
-            // natural scrolling, as on the laptop
-            self.wacc.0 += dx / 2.0 * 4.0 / self.gain.max(0.1);
-            self.wacc.1 += dy / 2.0 * 4.0 / self.gain.max(0.1);
+            // natural scrolling (as on the laptop) unless turned off
+            let k = if self.natural { 1.0 } else { -1.0 } * 4.0 / 1.2;
+            self.wacc.0 += dx / 2.0 * k;
+            self.wacc.1 += dy / 2.0 * k;
             let (wx, wy) = (self.wacc.0.trunc() as i32, self.wacc.1.trunc() as i32);
             if wx != 0 || wy != 0 {
                 self.wacc.0 -= wx as f32;
@@ -267,7 +293,7 @@ impl Board {
             }
             return;
         }
-        if self.pad_max >= 3 && moved > 40.0 {
+        if self.gestures && self.pad_max >= 3 && moved > 40.0 {
             let (sx, sy) = self.pad_sum;
             let a = if sx.abs() > sy.abs() {
                 if sx < 0.0 { Action::FocusColumnRight {} } else { Action::FocusColumnLeft {} }
@@ -281,7 +307,7 @@ impl Board {
             fx.push(Fx::Niri(a));
             return;
         }
-        if dur < 0.22 && moved < 12.0 {
+        if self.tap && dur < 0.22 && moved < 12.0 {
             let b = match self.pad_max {
                 1 => K::BTN_LEFT,
                 2 => K::BTN_RIGHT,

@@ -1,0 +1,27 @@
+# ~/.config/laptopkbd/config.toml  (laptopkbd-settings writes it; `pkill -HUP laptopkbd` re-reads it)
+
+skin = "graphite"          # graphite | silver | midnight | retro | oled | neon
+language = "auto"          # auto (from $LANG) | en | ru
+ru_legends = true          # second (Russian) legend on the letter keys
+keyboard_height = 0.60     # share of the screen height
+frow = "fkeys"             # fkeys | media (mute, volume, track, play/pause, brightness on F1-F8)
+tux_hints = true           # hold/tap Tux: keys show what Tux+key does in niri
+auto_laptop_mode = true    # enter laptop mode when a monitor is connected
+
+[trackpad]
+speed = 1.0
+width = 0.42               # share of the screen width
+natural_scroll = true
+tap_to_click = true
+gestures = true            # 3 fingers: columns / workspaces, 4 up: overview
+
+[widgets]                  # three slots per palm rest; battery and workspaces take two
+left = ["cpu", "gpu", "ram"]           # cpu gpu ram disk battery net clock temps workspaces
+right = ["battery", "disk"]
+
+[device]
+output = "DSI-1"                       # niri name of the built-in panel
+touchscreen = "FocalTech FT8203"       # substring of its evdev name
+transform = "270"                      # panel transform in laptop mode: normal | 90 | 180 | 270
+on_enter = "pkill -x squeekboard"      # shell hooks, e.g. pause auto-rotation / gesture daemons
+on_leave = ""

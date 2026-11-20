@@ -3,7 +3,12 @@ name = "laptopkbd"
 version = "0.2.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
-description = "Galaxy Tab S7 FE: the tablet screen as a laptop keyboard + trackpad while an external monitor is connected (niri)"
+description = "Turn a Linux tablet into the bottom half of a laptop: keyboard, trackpad and widgets on the touchscreen while a monitor is connected (niri)"
+repository = "https://github.com/Marker284/laptopkbd"
+readme = "README.md"
+
+[workspace]
+members = ["settings"]
 
 [dependencies]
 smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
@@ -14,6 +19,8 @@ fontdue = "0.9"
 evdev = "0.13"
 niri-ipc = "=26.4.0"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "display"] }
 libc = "0.2"
 
 [profile.release]

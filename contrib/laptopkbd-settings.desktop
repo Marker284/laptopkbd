@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Laptop Keyboard
+Comment=Skins, widgets and trackpad of the tablet keyboard
+Exec=laptopkbd-settings
+Icon=input-keyboard
+Type=Application
+Categories=Settings;HardwareSettings;

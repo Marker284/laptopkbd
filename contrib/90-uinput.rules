@@ -1,0 +1,3 @@
+# laptopkbd writes keys and pointer motion through /dev/uinput: give it to the input group.
+# (brltty's own uinput rule adds an ACL that leaves the group without access, hence setfacl.)
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput", RUN+="/usr/bin/setfacl -m g::rw,g:input:rw /dev/uinput"

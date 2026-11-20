@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! laptopkbd: while an external monitor is connected, the tablet panel (DSI-1)
-//! becomes the bottom half of a laptop: keyboard on top, trackpad between two
-//! palm rests that show a system monitor. Runs all the time inside niri; idle
-//! (no surface, no grab, no timers) while there is no external monitor.
+//! laptopkbd: while an external monitor is connected, the tablet panel becomes
+//! the bottom half of a laptop: keyboard on top, trackpad between two palm rests
+//! that show widgets. Runs all the time inside niri; idle (no surface, no grab,
+//! no timers) while there is no external monitor.
+//!
+//! Signals: SIGHUP = re-read ~/.config/laptopkbd/config.toml,
+//!          SIGUSR1 = toggle the preview (laptop mode without a monitor).
 //!
 //! Idea from hingeboard (github.com/brysonwf/hingeboard, GPL-2.0+).
 mod board;
+mod config;
 mod niri;
 mod stats;
 mod touch;
 mod ui;
 
 use board::{Board, Fx};
+use config::Config;
 use niri_ipc::{Action, ConfiguredPosition, OutputAction, PositionToSet, Transform, WorkspaceReferenceArg};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
@@ -51,9 +56,7 @@ use wayland_client::{
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 
-const PANEL: &str = "DSI-1";
-const TOUCH: &str = "FocalTech FT8203";
-const GAIN: f32 = 1.2; // pointer px per buffer px (buffer = 1.5 x logical)
+const GAIN: f32 = 1.2; // pointer px per buffer px at speed 1.0 (buffer = 1.5 x logical)
 
 struct Buf {
     buf: Buffer,
@@ -66,6 +69,7 @@ struct Surf {
     pool: Option<SlotPool>,
     bufs: Vec<Buf>,
     configured: bool,
+    size: (u32, u32),
     frame_pending: bool,
     needs_present: bool,
     damage: Option<Rect>,
@@ -81,11 +85,16 @@ struct App {
     qh: QueueHandle<App>,
     lh: LoopHandle<'static, App>,
 
+    cfg: Config,
     external: Option<String>,
     manual_off: Option<String>, // Esc held: stay off until this monitor goes away
     active: bool,
+    preview: bool,
     scale: f64,
     ru: bool,
+    ws: Vec<niri::Ws>,
+    hints: std::collections::HashMap<String, String>,
+    hints_on: bool,
 
     surf: Option<Surf>,
     ui: Option<Ui>,
@@ -102,11 +111,18 @@ fn flag() -> std::path::PathBuf {
     std::path::Path::new(&d).join("laptop-mode")
 }
 
+/// A user hook from the config, run detached through niri (inherits the session env).
+fn hook(cmd: &str) {
+    if !cmd.trim().is_empty() {
+        niri::action(Action::Spawn { command: vec!["sh".into(), "-c".into(), cmd.to_owned()] });
+    }
+}
+
 fn sh(cmd: &[&str]) {
     let _ = std::process::Command::new(cmd[0]).args(&cmd[1..]).status();
 }
 
-/// Keep the keyboard out of swap and first for the CPU (cgroup of our niri scope).
+/// Keep the keyboard out of swap and first for the CPU, when it runs in its own scope.
 fn protect() {
     if let Ok(cg) = std::fs::read_to_string("/proc/self/cgroup") {
         if let Some(unit) = cg.trim().rsplit('/').next() {
@@ -118,6 +134,31 @@ fn protect() {
     }
 }
 
+/// SIGHUP / SIGUSR1 arrive as channel messages (blocked in every thread, sigwait in one).
+fn signals(tx: channel::Sender<niri::Msg>) {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::sigaddset(&mut set, libc::SIGUSR2);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        std::thread::spawn(move || loop {
+            let mut sig = 0;
+            if libc::sigwait(&set, &mut sig) == 0 {
+                let m = match sig {
+                    libc::SIGUSR1 => niri::Msg::TogglePreview,
+                    libc::SIGUSR2 => niri::Msg::DemoHints,
+                    _ => niri::Msg::Reload,
+                };
+                if tx.send(m).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
 impl App {
     // ---- mode ----------------------------------------------------------
     fn on_outputs(&mut self, external: Option<String>, scale: f64) {
@@ -126,20 +167,32 @@ impl App {
             self.manual_off = None;
         }
         self.external = external.clone();
+        if self.preview {
+            return;
+        }
         match external {
-            Some(e) if !self.active && self.manual_off.is_none() => self.enter(&e),
+            Some(e) if !self.active && self.manual_off.is_none() && self.cfg.auto_laptop_mode => self.enter(&e),
             None if self.active => self.leave(),
             _ => {}
         }
     }
 
-    fn enter(&mut self, ext: &str) {
+    fn pause_tablet_mode(&self) {
         let _ = std::fs::write(flag(), b"");
-        sh(&["pkill", "-x", "lisgd"]);
-        sh(&["pkill", "-x", "squeekboard"]);
-        niri::output(PANEL, OutputAction::Transform { transform: Transform::_270 });
+        hook(&self.cfg.device.on_enter);
+        let t = match self.cfg.device.transform.as_str() {
+            "90" => Transform::_90,
+            "180" => Transform::_180,
+            "270" => Transform::_270,
+            _ => Transform::Normal,
+        };
+        niri::output(&self.cfg.device.output, OutputAction::Transform { transform: t });
+    }
+
+    fn enter(&mut self, ext: &str) {
+        self.pause_tablet_mode();
         for w in niri::workspaces() {
-            if w.output.as_deref() == Some(PANEL) && w.active_window_id.is_some() {
+            if w.output.as_deref() == Some(self.cfg.device.output.as_str()) && w.active_window_id.is_some() {
                 niri::action(Action::MoveWorkspaceToMonitor {
                     output: ext.to_owned(),
                     reference: Some(WorkspaceReferenceArg::Id(w.id)),
@@ -147,7 +200,7 @@ impl App {
             }
         }
         // the panel far away from the monitor: the pointer can not wander onto it
-        niri::output(PANEL, OutputAction::Position {
+        niri::output(&self.cfg.device.output, OutputAction::Position {
             position: PositionToSet::Specific(ConfiguredPosition { x: -10000, y: 0 }),
         });
         niri::action(Action::FocusMonitor { output: ext.to_owned() });
@@ -155,16 +208,43 @@ impl App {
         self.show();
     }
 
+    fn enter_preview(&mut self) {
+        self.pause_tablet_mode();
+        self.preview = true;
+        self.active = true;
+        self.show();
+    }
+
     fn leave(&mut self) {
         self.hide();
         self.active = false;
-        niri::output(PANEL, OutputAction::Position { position: PositionToSet::Automatic });
+        if !self.preview {
+            niri::output(&self.cfg.device.output, OutputAction::Position { position: PositionToSet::Automatic });
+        }
+        self.preview = false;
         let _ = std::fs::remove_file(flag());
-        sh(&["pkill", "-f", "tablet-autorotate"]);
-        sh(&["pkill", "-x", "lisgd"]);
-        niri::action(Action::Spawn {
-            command: vec!["sh".into(), "-c".into(), "$HOME/.local/bin/tablet-autorotate".into()],
-        });
+        hook(&self.cfg.device.on_leave);
+    }
+
+    fn reload(&mut self) {
+        let old = std::mem::replace(&mut self.cfg, Config::load());
+        if let Some(b) = self.board.as_mut() {
+            b.configure(&self.cfg.trackpad, GAIN);
+        }
+        if old != self.cfg {
+            if let Some((w, h)) = self.surf.as_ref().filter(|s| s.configured).map(|s| s.size) {
+                self.rebuild_ui(w, h);
+            }
+        }
+        if !self.cfg.auto_laptop_mode && self.active && !self.preview {
+            self.leave();
+        } else if self.cfg.auto_laptop_mode && !self.active {
+            if let Some(e) = self.external.clone() {
+                if self.manual_off.is_none() {
+                    self.enter(&e);
+                }
+            }
+        }
     }
 
     fn show(&mut self) {
@@ -172,19 +252,13 @@ impl App {
             return;
         }
         let Some(out) = self.outputs.outputs().find(|o| {
-            self.outputs.info(o).and_then(|i| i.name).as_deref() == Some(PANEL)
+            self.outputs.info(o).and_then(|i| i.name).as_deref() == Some(self.cfg.device.output.as_str())
         }) else {
-            eprintln!("laptopkbd: no wl_output {PANEL}");
+            eprintln!("laptopkbd: no wl_output {}", self.cfg.device.output);
             return;
         };
         let surface = self.compositor.create_surface(&self.qh);
-        let layer = self.layer_shell.create_layer_surface(
-            &self.qh,
-            surface,
-            Layer::Overlay,
-            Some("laptopkbd"),
-            Some(&out),
-        );
+        let layer = self.layer_shell.create_layer_surface(&self.qh, surface, Layer::Overlay, Some("laptopkbd"), Some(&out));
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -196,6 +270,7 @@ impl App {
             pool: None,
             bufs: Vec::new(),
             configured: false,
+            size: (0, 0),
             frame_pending: false,
             needs_present: false,
             damage: None,
@@ -204,7 +279,7 @@ impl App {
 
     fn hide(&mut self) {
         if let Some(t) = self.touch_tok.take() {
-            self.lh.remove(t); // drops RawTouch: closes the fd, ends the grab
+            self.lh.remove(t); // drops RawTouch: ends the grab, closes the fd
         }
         for t in [self.stats_tok.take(), self.esc_tok.take()].into_iter().flatten() {
             self.lh.remove(t);
@@ -217,7 +292,23 @@ impl App {
             drop(s.bufs);
             drop(s.layer);
         }
-        self.ui = None; // frees the canvas
+        self.ui = None;
+        self.hints_on = false;
+    }
+
+    fn rebuild_ui(&mut self, lw: u32, lh: u32) {
+        let s = self.scale as f32;
+        let (pw, ph) = ((lw as f32 * s).round() as u32, (lh as f32 * s).round() as u32);
+        let mut ui = Ui::new(pw, ph, s, &self.cfg);
+        ui.hints = self.hints.clone();
+        ui.draw_all(self.ru, &self.stats, &self.ws, self.external.as_deref());
+        let codes: Vec<u16> = ui.keys.iter().map(|k| k.code).collect();
+        self.ui = Some(ui);
+        if let Some(b) = self.board.as_mut() {
+            b.set_keys(codes);
+        }
+        self.mark(Rect::new(0.0, 0.0, pw as f32, ph as f32));
+        self.present();
     }
 
     fn configured(&mut self, lw: u32, lh: u32) {
@@ -241,26 +332,27 @@ impl App {
         }
         surf.pool = Some(pool);
         surf.configured = true;
+        surf.size = (lw, lh);
 
-        let first = self.ui.is_none();
-        let mut ui = Ui::new(pw, ph, s);
-        if first {
+        if self.ui.is_none() {
             self.stats.update();
+            self.hints = niri::tux_binds();
         }
-        ui.draw_all(self.ru, &self.stats);
-        let codes: Vec<u16> = ui.keys.iter().map(|k| k.code).collect();
-        self.ui = Some(ui);
-        self.redraw_keys_state();
-        self.mark(Rect::new(0.0, 0.0, pw as f32, ph as f32));
-
         if self.board.is_none() {
-            match Board::new(codes, GAIN) {
-                Ok(b) => self.board = Some(b),
+            let keys: Vec<u16> = Ui::new(1, 1, s, &self.cfg).keys.iter().map(|k| k.code).collect();
+            match Board::new(ui::all_codes(), keys, GAIN) {
+                Ok(mut b) => {
+                    b.configure(&self.cfg.trackpad, GAIN);
+                    self.board = Some(b);
+                }
                 Err(e) => eprintln!("laptopkbd: uinput: {e}"),
             }
         }
+        self.rebuild_ui(lw, lh);
+
         if self.touch_tok.is_none() {
-            match RawTouch::open(TOUCH) {
+            let rot = self.cfg.device.transform.parse().unwrap_or(0);
+            match RawTouch::open(&self.cfg.device.touchscreen, rot) {
                 Ok(rt) => {
                     let src = Generic::new(rt, Interest::READ, Mode::Level);
                     self.touch_tok = self
@@ -288,7 +380,7 @@ impl App {
                 .insert_source(Timer::from_duration(Duration::from_secs(2)), |_, _, app: &mut App| {
                     app.stats.update();
                     if let Some(ui) = app.ui.as_mut() {
-                        let rs = ui.draw_panels(&app.stats);
+                        let rs = ui.draw_panels(&app.stats, &app.ws, app.external.as_deref());
                         for r in rs {
                             app.mark(r);
                         }
@@ -323,12 +415,10 @@ impl App {
         }
     }
 
-    fn redraw_keys_state(&mut self) {
+    fn redraw_all_keys(&mut self) {
         let n = self.ui.as_ref().map_or(0, |u| u.keys.len());
         for i in 0..n {
-            if self.look(i) != Look::Normal {
-                self.redraw_key(i);
-            }
+            self.redraw_key(i);
         }
     }
 
@@ -341,6 +431,8 @@ impl App {
                     b.key_down(t.id, i, ui.keys[i].code, &mut fx);
                 } else if ui.pad.contains(t.x, t.y, 12.0 * ui.s) {
                     b.pad_begin(t.id, t.x, t.y, &mut fx);
+                } else if let Some((_, id)) = ui.ws_hits.iter().find(|(r, _)| r.contains(t.x, t.y, 4.0 * ui.s)) {
+                    fx.push(Fx::Niri(Action::FocusWorkspace { reference: WorkspaceReferenceArg::Id(*id) }));
                 }
             }
             Kind::Move => b.pad_move(t.id, t.x, t.y),
@@ -394,6 +486,15 @@ impl App {
                 }
             }
         }
+        // Tux held or latched: keys show the niri binds
+        let tux = self.cfg.tux_hints && self.board.as_ref().map_or(false, |b| b.tux_active());
+        if tux != self.hints_on {
+            self.hints_on = tux;
+            if let Some(ui) = self.ui.as_mut() {
+                ui.hints_on = tux;
+            }
+            self.redraw_all_keys();
+        }
     }
 
     fn set_ru(&mut self, ru: bool) {
@@ -401,14 +502,29 @@ impl App {
             return;
         }
         self.ru = ru;
-        // letters + the layout key
         let idx: Vec<usize> = self.ui.as_ref().map_or(Vec::new(), |u| {
-            u.keys.iter().enumerate().filter(|(_, k)| !k.ru.is_empty() || k.code == evdev::KeyCode::KEY_CAPSLOCK.0).map(|(i, _)| i).collect()
+            u.keys
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| !k.ru.is_empty() || k.code == evdev::KeyCode::KEY_CAPSLOCK.0)
+                .map(|(i, _)| i)
+                .collect()
         });
         for i in idx {
             self.redraw_key(i);
         }
         self.present();
+    }
+
+    fn set_workspaces(&mut self, ws: Vec<niri::Ws>) {
+        self.ws = ws;
+        if let Some(ui) = self.ui.as_mut() {
+            let rs = ui.draw_workspaces(&self.stats, &self.ws, self.external.as_deref());
+            for r in rs {
+                self.mark(r);
+            }
+            self.present();
+        }
     }
 
     // ---- presenting ----------------------------------------------------
@@ -503,9 +619,8 @@ impl OutputHandler for App {
 
 impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        // the compositor dropped our surface (output gone): forget it, show() again later
         self.hide();
-        if self.active && self.external.is_some() {
+        if self.active {
             self.show();
         }
     }
@@ -514,11 +629,7 @@ impl LayerShellHandler for App {
         if w == 0 || h == 0 {
             return;
         }
-        let same = self.surf.as_ref().map_or(false, |s| s.configured)
-            && self.ui.as_ref().map_or(false, |u| {
-                (u.w - (w as f32 * self.scale as f32).round()).abs() < 1.0
-                    && (u.h - (h as f32 * self.scale as f32).round()).abs() < 1.0
-            });
+        let same = self.surf.as_ref().map_or(false, |s| s.configured && s.size == (w, h));
         if !same {
             self.configured(w, h);
         }
@@ -544,6 +655,12 @@ wayland_client::delegate_noop!(App: WpViewporter);
 wayland_client::delegate_noop!(App: WpViewport);
 
 fn main() {
+    if std::env::args().any(|a| a == "--version") {
+        println!("laptopkbd {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    let (tx, rx) = channel::channel::<niri::Msg>();
+    signals(tx.clone()); // before any other thread starts: they inherit the blocked mask
     protect();
     let conn = Connection::connect_to_env().expect("wayland");
     let (globals, queue) = registry_queue_init(&conn).expect("registry");
@@ -562,11 +679,16 @@ fn main() {
         viewporter,
         qh: qh.clone(),
         lh: lh.clone(),
+        cfg: Config::load(),
         external: None,
         manual_off: None,
         active: false,
+        preview: false,
         scale: 1.5,
         ru: false,
+        ws: Vec::new(),
+        hints: Default::default(),
+        hints_on: false,
         surf: None,
         ui: None,
         board: None,
@@ -578,20 +700,42 @@ fn main() {
     };
     let _ = std::fs::remove_file(flag());
 
-    let (tx, rx) = channel::channel::<niri::Msg>();
     lh.insert_source(rx, |e, _, app: &mut App| {
         if let ChEvent::Msg(m) = e {
             match m {
                 niri::Msg::Outputs { external, panel_scale } => app.on_outputs(external, panel_scale),
                 niri::Msg::LayoutRu(ru) => app.set_ru(ru),
+                niri::Msg::Workspaces(ws) => app.set_workspaces(ws),
+                niri::Msg::ConfigReloaded => {
+                    app.hints = niri::tux_binds();
+                    if let Some(ui) = app.ui.as_mut() {
+                        ui.hints = app.hints.clone();
+                    }
+                }
+                niri::Msg::Reload => app.reload(),
+                niri::Msg::DemoHints => {
+                    app.hints_on = !app.hints_on;
+                    let on = app.hints_on;
+                    if let Some(ui) = app.ui.as_mut() {
+                        ui.hints_on = on;
+                    }
+                    app.redraw_all_keys();
+                    app.present();
+                }
+                niri::Msg::TogglePreview => {
+                    if app.preview {
+                        app.leave();
+                    } else if !app.active {
+                        app.enter_preview();
+                    }
+                }
             }
         }
     })
     .expect("channel");
-    niri::watch_outputs(tx.clone(), PANEL.to_owned());
-    niri::watch_layout(tx);
+    niri::watch_outputs(tx.clone(), app.cfg.device.output.clone());
+    niri::watch_events(tx);
 
-    // outputs are known after the first roundtrip
     ev.dispatch(Duration::from_millis(200), &mut app).ok();
     loop {
         if ev.dispatch(None, &mut app).is_err() {
